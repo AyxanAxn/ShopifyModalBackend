@@ -174,6 +174,11 @@ export async function POST(request) {
       customData: sanitizeCustomData(body, config)
     });
 
+    // Mağaza üçün bu event söndürülüb ("events" siyahısında yoxdur) — Meta-ya getmir.
+    if (result?.skipped) {
+      return json({ ok: true, skipped: true, reason: result.reason });
+    }
+
     return json({
       ok: true,
       eventId,

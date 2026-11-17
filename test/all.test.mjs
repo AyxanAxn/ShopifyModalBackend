@@ -94,6 +94,21 @@ const postEvent = async (shop, body, opts = {}) => {
   const res = await metaEvent.POST(req(signedUrl("/api/meta-event", shop, opts), body));
   return { status: res.status, data: await res.json() };
 };
+async function withEnv(vars, fn) {
+  const saved = {};
+  for (const [k, v] of Object.entries(vars)) {
+    saved[k] = process.env[k];
+    if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+  try { return await fn(); }
+  finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+}
+// Yalnız Purchase göndərən mağaza konfiqi (De Cobra kimi)
+const PURCHASE_ONLY = JSON.stringify({ [SHOP_A]: { pixel_id: "111", access_token: "tokA", events: ["Purchase"] } });
 const gql = () => calls.filter(c => c.url.includes("/admin/api/")).map(c => JSON.parse(c.body));
 const gqlNames = () => gql().map(c => c.query.match(/mutation (\w+)/)[1]);
 const metaCalls = () => calls.filter(c => c.url.includes("graph.facebook.com")).map(c => ({ url: c.url, auth: c.auth, body: JSON.parse(c.body) }));
@@ -152,6 +167,19 @@ globalThis.fetch = async (url, init = {}) => {
   }
   if (u.includes("graph.facebook.com")) {
     if (scenario.metaFail) return Response.json({ error: { message: "Invalid OAuth access token" } }, { status: 400 });
+    if (scenario.metaNetworkError) throw new TypeError("fetch failed");
+    if (scenario.metaHtml502) return new Response("<html>Bad Gateway</html>", { status: 502 });
+    if (scenario.metaErrorIn200) return Response.json({ error: { message: "Unsupported post request" } });
+    if (scenario.metaHang) {
+      // Meta cavab vermir — yalnız sorğunun öz timeout siqnalı ilə bitir.
+      return new Promise((_, reject) => {
+        const signal = init.signal;
+        if (!signal) return reject(new Error("no timeout signal on Meta fetch"));
+        // AbortSignal.timeout taymeri prosesi oyaq saxlamır — testdə özümüz saxlayırıq.
+        const keepAlive = setInterval(() => {}, 50);
+        signal.addEventListener("abort", () => { clearInterval(keepAlive); reject(signal.reason); }, { once: true });
+      });
+    }
     return Response.json({ events_received: 1, fbtrace_id: "tr1" });
   }
   throw new Error("unmocked fetch: " + u);
@@ -231,6 +259,74 @@ await t("sendMetaEvent: konfiq yoxdursa skipped, fetch çağırılmır", async (
 await t("sendMetaEvent: Meta xəta cavabı → throw (mesajla)", async () => {
   scenario.metaFail = true;
   await assert.rejects(() => meta.sendMetaEvent({ shop: SHOP_A, eventName: "Purchase", eventId: "e1" }), /Invalid OAuth/);
+});
+await t("events siyahısı: yoxdur/boşdur → bütün eventlər; varsa yalnız siyahıdakılar", async () => {
+  assert.equal(meta.getMetaStoreConfig(SHOP_A).events, null);
+  assert.equal(meta.isMetaEventEnabled(meta.getMetaStoreConfig(SHOP_A), "AddToCart"), true);
+  assert.equal(meta.isMetaEventEnabled(null, "Purchase"), false);
+  await withEnv({ META_STORES_JSON: PURCHASE_ONLY }, () => {
+    const c = meta.getMetaStoreConfig(SHOP_A);
+    assert.deepEqual([...c.events], ["purchase"]);
+    assert.equal(meta.isMetaEventEnabled(c, "Purchase"), true);
+    assert.equal(meta.isMetaEventEnabled(c, "AddToCart"), false);
+    assert.equal(meta.isMetaEventEnabled(c, "InitiateCheckout"), false);
+  });
+  for (const bad of [[], "Purchase", [""], null]) {
+    await withEnv({ META_STORES_JSON: JSON.stringify({ [SHOP_A]: { pixel_id: "1", access_token: "t", events: bad } }) }, () => {
+      assert.equal(meta.getMetaStoreConfig(SHOP_A).events, null);
+    });
+  }
+});
+await t("sendMetaEvent: siyahıda olmayan event → skipped meta_event_not_enabled, fetch çağırılmır", async () => {
+  await withEnv({ META_STORES_JSON: PURCHASE_ONLY }, async () => {
+    const r = await meta.sendMetaEvent({ shop: SHOP_A, eventName: "AddToCart", eventId: "e1" });
+    assert.deepEqual(r, { ok: false, skipped: true, reason: "meta_event_not_enabled" });
+    assert.equal(calls.length, 0);
+    assert.equal((await meta.sendMetaEvent({ shop: SHOP_A, eventName: "Purchase", eventId: "e2" })).ok, true);
+    assert.equal(metaCalls().length, 1);
+  });
+});
+await t("events: böyük/kiçik hərf fərqi yoxdur (\"purchase\" = \"Purchase\")", async () => {
+  await withEnv({ META_STORES_JSON: JSON.stringify({ [SHOP_A]: { pixel_id: "1", access_token: "t", events: [" purchase "] } }) }, () => {
+    const c = meta.getMetaStoreConfig(SHOP_A);
+    assert.equal(meta.isMetaEventEnabled(c, "Purchase"), true);
+    assert.equal(meta.isMetaEventEnabled(c, "AddToCart"), false);
+  });
+});
+await t("getMetaStoreConfig: açar https:// / böyük hərf / sonda '/' ilə yazılsa da tapılır; başqa mağaza tapılmır", async () => {
+  for (const key of ["https://Store-A.myshopify.com/", "STORE-A.MYSHOPIFY.COM", "store-a"]) {
+    await withEnv({ META_STORES_JSON: JSON.stringify({ [key]: { pixel_id: "9", access_token: "t" } }) }, () => {
+      assert.equal(meta.getMetaStoreConfig(SHOP_A)?.pixelId, "9", key);
+      assert.equal(meta.getMetaStoreConfig(SHOP_B), null, key);
+    });
+  }
+});
+await t("getMetaStoreConfig: JSON obyekt deyil (massiv / sətir / null / mağaza dəyəri sətirdir) → null", async () => {
+  for (const raw of ["[]", "\"x\"", "null", "5", JSON.stringify({ [SHOP_A]: "tok" })]) {
+    await withEnv({ META_STORES_JSON: raw }, () => { assert.equal(meta.getMetaStoreConfig(SHOP_A), null, raw); });
+  }
+});
+await t("META_TIMEOUT_MS: yoxdur / pozuq / həddən kənar → 4000; düzgün → həmin dəyər", async () => {
+  for (const bad of [undefined, "", "abc", "0", "499", "15001", "-5"]) {
+    await withEnv({ META_TIMEOUT_MS: bad }, () => { assert.equal(meta.getMetaTimeoutMs(), 4000, String(bad)); });
+  }
+  await withEnv({ META_TIMEOUT_MS: "2500" }, () => { assert.equal(meta.getMetaTimeoutMs(), 2500); });
+});
+await t("sendMetaEvent: şəbəkə xətası / HTML 502 / 200 içində error → throw", async () => {
+  scenario = { metaNetworkError: true };
+  await assert.rejects(() => meta.sendMetaEvent({ shop: SHOP_A, eventName: "Purchase", eventId: "e1" }), /fetch failed/);
+  scenario = { metaHtml502: true };
+  await assert.rejects(() => meta.sendMetaEvent({ shop: SHOP_A, eventName: "Purchase", eventId: "e1" }), /Meta CAPI HTTP 502/);
+  scenario = { metaErrorIn200: true };
+  await assert.rejects(() => meta.sendMetaEvent({ shop: SHOP_A, eventName: "Purchase", eventId: "e1" }), /Unsupported post request/);
+});
+await t("sendMetaEvent: Meta cavab vermir → timeout ilə kəsilir (throw)", async () => {
+  scenario.metaHang = true;
+  await withEnv({ META_TIMEOUT_MS: "500" }, async () => {
+    const started = Date.now();
+    await assert.rejects(() => meta.sendMetaEvent({ shop: SHOP_A, eventName: "Purchase", eventId: "e1" }), /Meta CAPI timeout \(500 ms\)/);
+    assert.ok(Date.now() - started < 3000);
+  });
 });
 
 // =============================================================================
@@ -631,6 +727,84 @@ await t("content_id_mode=product → content_ids product id-dir", async () => {
   assert.deepEqual(r.data.metaPurchase.contentIds, ["222"]);
   assert.equal("test_event_code" in metaCalls()[0].body, false);
 });
+await t("capiStatus: sent / not_configured / no_consent / failed", async () => {
+  assert.equal((await post(SHOP_A, goodBody())).data.metaPurchase.capiStatus, "sent");
+  assert.equal((await post(SHOP_B, goodBody())).data.metaPurchase.capiStatus, "not_configured");
+  assert.equal((await post(SHOP_A, goodBody({ meta: { marketing_allowed: false } }))).data.metaPurchase.capiStatus, "no_consent");
+  scenario.metaFail = true;
+  assert.equal((await post(SHOP_A, goodBody())).data.metaPurchase.capiStatus, "failed");
+});
+await t("events: [\"Purchase\"] olan mağaza: Purchase gedir (1 dəfə)", async () => {
+  await withEnv({ META_STORES_JSON: PURCHASE_ONLY }, async () => {
+    const r = await post(SHOP_A, goodBody());
+    assert.equal(r.status, 200); assert.equal(r.data.metaPurchase.capiStatus, "sent");
+    const m = metaCalls();
+    assert.equal(m.length, 1); assert.equal(m[0].body.data[0].event_name, "Purchase");
+  });
+});
+await t("events siyahısında Purchase yoxdursa: sifariş keçir, Purchase getmir", async () => {
+  await withEnv({ META_STORES_JSON: JSON.stringify({ [SHOP_A]: { pixel_id: "111", access_token: "tokA", events: ["AddToCart"] } }) }, async () => {
+    const r = await post(SHOP_A, goodBody());
+    assert.equal(r.status, 200); assert.equal(r.data.metaPurchase.capiStatus, "event_not_enabled");
+    assert.equal(metaCalls().length, 0);
+  });
+});
+await t("Meta şəbəkə xətası / HTML 502 / 200 içində error → sifariş yenə 200, capiStatus=failed", async () => {
+  for (const key of ["metaNetworkError", "metaHtml502", "metaErrorIn200"]) {
+    scenario = { [key]: true };
+    const r = await post(SHOP_A, goodBody());
+    assert.equal(r.status, 200, key); assert.equal(r.data.ok, true, key); assert.equal(r.data.orderName, "#D1", key);
+    assert.equal(r.data.metaPurchase.capiStatus, "failed", key);
+    assert.deepEqual(gqlNames(), ["CreateCodDraftOrder", "CompleteCodDraftOrder"], key);
+    calls = [];
+  }
+});
+await t("modal fbp / fbc / user_agent göndərməsə də Purchase gedir (həmin sahələr olmadan)", async () => {
+  const r = await post(SHOP_A, goodBody({ meta: { marketing_allowed: true } }));
+  assert.equal(r.data.metaPurchase.capiStatus, "sent");
+  const ev = metaCalls()[0].body.data[0];
+  assert.equal(ev.event_source_url, `https://${SHOP_A}`);
+  assert.equal("fbp" in ev.user_data, false); assert.equal("client_user_agent" in ev.user_data, false);
+  assert.equal(ev.user_data.ph[0].length, 64);
+});
+await t("marketing_allowed yalnız true (boolean) sayılır: \"true\" / 1 → göndərilmir", async () => {
+  for (const v of ["true", 1, "yes", null]) {
+    const r = await post(SHOP_A, goodBody({ meta: { marketing_allowed: v } }));
+    assert.equal(r.data.metaPurchase.capiStatus, "no_consent", String(v));
+  }
+  assert.equal(metaCalls().length, 0);
+});
+await t("bir neçə məhsul: contents, num_items və dəyər düzgün; 1 sifariş = 1 Purchase", async () => {
+  const r = await post(SHOP_A, goodBody({ items: [{ variant_id: 111, product_id: 222, quantity: 2 }, { variant_id: 333, product_id: 444, quantity: 3 }] }));
+  const m = metaCalls();
+  assert.equal(m.length, 1);
+  const cd = m[0].body.data[0].custom_data;
+  assert.deepEqual(cd.content_ids, ["111", "333"]); assert.equal(cd.num_items, 5); assert.equal(cd.value, 49.99);
+  assert.equal(r.data.metaPurchase.numItems, 5);
+});
+await t("iki ayrı sifariş → iki fərqli event_id (Meta birini dedup edib atmır)", async () => {
+  const a = await post(SHOP_A, goodBody());
+  const b = await post(SHOP_A, goodBody());
+  assert.notEqual(a.data.metaPurchase.eventId, b.data.metaPurchase.eventId);
+  assert.equal(metaCalls().length, 2);
+});
+await t("bloklanmış nömrə / SHIPPING_MISMATCH → order yoxdur, Purchase getmir", async () => {
+  const blocked = await post(SHOP_A, goodBody({ customer: { ...goodCustomer, phone: "050 999 99 99" } }));
+  assert.equal(blocked.status, 403);
+  const mismatch = await post(SHOP_A, goodBody({ delivery: { expected_shipping_cents: 400 } }));
+  assert.equal(mismatch.status, 409);
+  assert.equal(metaCalls().length, 0);
+});
+await t("Meta cavab vermir → sifariş ilişmir: timeout-dan sonra 200, capiStatus=failed", async () => {
+  scenario.metaHang = true;
+  await withEnv({ META_TIMEOUT_MS: "500" }, async () => {
+    const started = Date.now();
+    const r = await post(SHOP_A, goodBody());
+    assert.ok(Date.now() - started < 3000);
+    assert.equal(r.status, 200); assert.equal(r.data.ok, true); assert.equal(r.data.orderName, "#D1");
+    assert.equal(r.data.metaPurchase.capiSent, false); assert.equal(r.data.metaPurchase.capiStatus, "failed");
+  });
+});
 
 // =============================================================================
 describe("I. create.js — xəta halları");
@@ -687,6 +861,15 @@ await t("yalnız AddToCart / InitiateCheckout; Purchase və başqaları → 400"
 await t("konfiq olmayan mağaza → skipped meta_not_configured", async () => {
   const r = await postEvent(SHOP_B, { marketing_allowed: true, event_name: "AddToCart" });
   assert.equal(r.data.reason, "meta_not_configured"); assert.equal(metaCalls().length, 0);
+});
+await t("events: [\"Purchase\"] olan mağaza: AddToCart / InitiateCheckout serverdən getmir (skipped)", async () => {
+  await withEnv({ META_STORES_JSON: PURCHASE_ONLY }, async () => {
+    for (const name of ["AddToCart", "InitiateCheckout"]) {
+      const r = await postEvent(SHOP_A, { marketing_allowed: true, event_name: name, event_id: "x1" });
+      assert.equal(r.status, 200); assert.equal(r.data.skipped, true); assert.equal(r.data.reason, "meta_event_not_enabled");
+    }
+    assert.equal(metaCalls().length, 0);
+  });
 });
 await t("AddToCart → CAPI; modalın event_id-si saxlanır (brauzer pixel ilə dedup)", async () => {
   const r = await postEvent(SHOP_A, { marketing_allowed: true, event_name: "AddToCart", event_id: "add_to_cart_abc", fbp: "fb.1.2.3", fbc: "fb.1.9.x", user_agent: "UA", event_source_url: "https://x.test/p", currency: "azn", value: 49.99, items: [{ variant_id: 111, quantity: 2 }] });

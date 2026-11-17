@@ -854,6 +854,31 @@ export async function POST(request) {
       }
     }
 
+    // Brauzerə yalnız qısa status gedir; təfərrüat (Meta-nın xəta mətni) log-da qalır.
+    const capiStatus = metaCapi?.ok === true
+      ? "sent"
+      : metaCapi?.skipped
+        ? (metaCapi.reason === "marketing_consent_not_allowed" ? "no_consent"
+          : metaCapi.reason === "meta_event_not_enabled" ? "event_not_enabled"
+          : "not_configured")
+        : "failed";
+
+    // Meta konfiqi olan mağazalar üçün bir sətirlik log (şəxsi məlumat yoxdur) —
+    // Purchase-in Meta-ya çatıb-çatmadığını Vercel log-undan yoxlamaq üçün.
+    if (metaConfig) {
+      console.log("Meta CAPI Purchase:", JSON.stringify({
+        shop,
+        order: orderName,
+        status: capiStatus,
+        eventId: metaEventId,
+        value: purchaseValue,
+        currency: purchaseCurrency,
+        eventsReceived: metaCapi?.eventsReceived ?? null,
+        fbtraceId: metaCapi?.fbtraceId ?? null,
+        reason: metaCapi?.ok ? null : (metaCapi?.reason || null)
+      }));
+    }
+
     return json({
       ok: true,
       shop,
@@ -877,7 +902,8 @@ export async function POST(request) {
           (sum, item) => sum + Number(item.quantity || 0),
           0
         ),
-        capiSent: metaCapi?.ok === true
+        capiSent: metaCapi?.ok === true,
+        capiStatus
       }
     });
   } catch (error) {
